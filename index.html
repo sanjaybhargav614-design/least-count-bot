@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Least Count vs Bot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Least Count</h1>
+  <div class="hright">
+    <div id="info"></div>
+    <button id="muteBtn" aria-label="Toggle sound" title="Toggle sound">🔊</button>
+  </div>
+</header>
+
+<div id="layout">
+<div id="table">
+  <div class="zone">
+    <div class="label" id="botLabel">Bot</div>
+    <div class="row" id="botHand"></div>
+  </div>
+  <div id="center">
+    <div class="pile" id="deck"><div class="count" id="deckCount"></div></div>
+    <div class="pile" id="open"><div class="count" id="openCount"></div></div>
+    <div class="pile" id="joker"><div class="count" id="jokerCount"></div></div>
+  </div>
+  <div class="zone">
+    <div class="row" id="myHand"></div>
+    <div class="label" id="myLabel">Your hand · <b id="myTotal"></b></div>
+    <div class="sortbar"><span>Arrange:</span>
+      <button class="mini" data-sort="rank" title="Sort by rank">Rank</button>
+      <button class="mini" data-sort="suit" title="Group by suit">Suit</button>
+      <button class="mini" data-sort="points" title="Lowest points first">Points</button>
+      <span class="hint">or drag a card</span>
+    </div>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <div id="controls">
+    <button id="dropBtn" class="primary">Drop selected</button>
+    <button id="takeBtn">Take card under drop</button>
+    <button id="drawBtn">Draw from pile</button>
+    <button id="showBtn" class="primary">Show</button>
+    <button id="passBtn">Continue to drop</button>
+    <button id="nextBtn" class="primary">Next round</button>
+  </div>
+  <div id="log"></div>
+</div>
+<aside id="score">
+  <h3>Scores</h3>
+  <table>
+    <thead><tr><th>Round</th><th>You</th><th>Bot</th></tr></thead>
+    <tbody id="scoreBody"></tbody>
+    <tfoot><tr><th>Total</th><th id="totYou">0</th><th id="totBot">0</th></tr></tfoot>
+  </table>
+</aside>
+</div>
+
+<div id="banner"></div>
+
+<div id="start" class="overlay">
+  <h2>Least Count</h2>
+  <p>You play against the bot. Drop cards of one rank, then pick a card. Show when your total is 6 or less.
+     The lowest total wins. First to 200 loses.</p>
+  <button id="startBtn" class="primary">Start game</button>
+</div>
+
+<div id="over" class="overlay hidden">
+  <h2 id="overTitle"></h2>
+  <p id="overText"></p>
+  <button id="againBtn" class="primary">Play again</button>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
