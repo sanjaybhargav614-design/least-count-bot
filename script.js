@@ -55,6 +55,7 @@ function binom(n, k) {
 function newState() {
   return {
     deck: [], openPile: [], hands: [[], []], known: [[], []], bound: [-1, -1],
+    slots: [[], []],
     setAside: "", jokerRank: "", topOpen: "", roundOver: false, gameOver: false,
     forceShow: false, turnsInRound: 0, turn: 0, player0Opens: true, round: 1, scores: [0, 0],
   };
@@ -82,6 +83,8 @@ function drawFromDeck() {
 function dealCore() {
   G.deck = shuffled(makeDeck());
   G.hands = [[], []]; G.known = [[], []]; G.bound = [-1, -1]; G.openPile = [];
+  // slots[v][i] = ranks that viewer v knows the opponent's i-th unseen card is NOT.
+  G.slots = [0, 1].map(() => Array.from({ length: 7 }, () => new Set()));
   for (let i = 0; i < 7; i++) { G.hands[0].push(G.deck.pop()); G.hands[1].push(G.deck.pop()); }
   G.openPile.push(G.deck.pop());
   setTop();
@@ -100,11 +103,13 @@ function dropGroup(me, cards) {
     prevOpen: prev, prevIndex: 0, canTake: prev !== "",
     noPick: prev !== "" && rankOf(cards[0]) === rankOf(prev),
   };
+  let unseen = 0;
   for (const c of cards) {
     removeOne(G.hands[me], c);
-    removeOne(G.known[1 - me], c);     // the opponent now sees these cards
+    if (!removeOne(G.known[1 - me], c)) unseen++;   // the opponent now sees these cards
     G.openPile.push(c);
   }
+  trackDrop(1 - me, rankOf(cards[0]), unseen);
   if (a.canTake) a.prevIndex = G.openPile.length - cards.length - 1;
   const y = valueOf(cards[0], G.jokerRank);
   G.bound[me] = a.noPick ? 2 * y : y;
@@ -281,7 +286,7 @@ function chooseDrop(me) {
 // This is a heuristic policy, not a mathematically proven optimal solver.
 const CHALLENGER_CFG = Object.freeze({
   riskModel: "corrected",
-  oppRisk: 2,
+  oppRisk: 1,                 // was 2: keeps the exposure coefficient from going negative for big cards
   pickMargin: 1.5,
   showMargin: 30,
   safeShowPenProb: 0.005,
@@ -305,7 +310,8 @@ function exactHoldProbability(me, rank, pool) {
   return Math.max(0, Math.min(1, 1 - binom(n - copies, m) / denom));
 }
 
-function challengerChooseDrop(me) {
+// Returns every drop option, scored and sorted best-first.
+function challengerRankDrops(me) {
   let opts = getDropOptions(me);
   const pool = hiddenPool(me);
   const avg = poolAverage(pool);
@@ -332,7 +338,8 @@ function challengerChooseDrop(me) {
       ? G.hands[me].filter(c => rankOf(c) === rankOf(top))
           .reduce((sum, c) => sum + valueOf(c, G.jokerRank), 0)
       : 0;
-    const exposureCost = CHALLENGER_CFG.oppRisk * rankProb * exposedValue;
+    // The opponent only saves one pick if they hold this rank, never more than an average card.
+    const exposureCost = CHALLENGER_CFG.oppRisk * rankProb * Math.min(avg, exposedValue);
     o.challengerScore = points - ownPickupCost - exposureCost
       + sizeBonus + noPickBonus + zeroGroupBonus + CHALLENGER_CFG.setupW * setup;
   }
@@ -340,8 +347,9 @@ function challengerChooseDrop(me) {
   opts.sort((a, b) => b.challengerScore - a.challengerScore
     || b.cards.reduce((s,c)=>s+valueOf(c,G.jokerRank),0) - a.cards.reduce((s,c)=>s+valueOf(c,G.jokerRank),0)
     || b.cards.length - a.cards.length);
-  return opts[0];
+  return opts;
 }
+function challengerChooseDrop(me) { return challengerRankDrops(me)[0]; }
 
 function challengerTakesOpen(me, openCard) {
   if (!openCard) return false;
@@ -364,8 +372,7 @@ function challengerPick(me, action) {
     G.known[opp].push(c);
     return { type: "take", card: c };
   }
-  const c = drawFromDeck();
-  if (c) G.hands[me].push(c);
+  const c = drawInto(me);
   return { type: "draw", card: c };
 }
 
@@ -376,6 +383,157 @@ function challengerShowCheck(me) {
   const eg = expectedGain(est);
   const safeShow = t === 0 || est.penProb <= CHALLENGER_CFG.safeShowPenProb;
   return { shows: safeShow || eg >= CHALLENGER_CFG.showMargin, t, est, eg };
+}
+
+// ==== Monte Carlo decision engine ============================================
+// Samples possible opponent hands (respecting what we know they cannot hold),
+// plays each candidate move out to the end of the round, and picks the best average.
+const MC = { ms: 400, min: 24, max: 200 };
+
+// Draw a card into hand `me` and give the opponent's view a fresh, unconstrained slot.
+function drawInto(me) {
+  const c = drawFromDeck();
+  if (c) { G.hands[me].push(c); G.slots[1 - me].push(new Set()); }
+  return c;
+}
+// Viewer v saw the opponent drop `n` unseen cards of `rank`: those slots are gone,
+// and no remaining unseen card can be that rank.
+function trackDrop(v, rank, n) {
+  const sl = G.slots[v];
+  for (let k = 0; k < n && sl.length; k++) {
+    let best = -1;
+    sl.forEach((s, i) => { if (!s.has(rank) && (best < 0 || s.size < sl[best].size)) best = i; });
+    sl.splice(best < 0 ? sl.length - 1 : best, 1);
+  }
+  for (const s of sl) s.add(rank);
+}
+function applyPick(me, a, take) {
+  if (take && a.canTake) {
+    const c = takePrevOpen(a);
+    G.hands[me].push(c); G.known[1 - me].push(c);
+    return { type: "take", card: c };
+  }
+  return { type: "draw", card: drawInto(me) };
+}
+function cloneState(s) {
+  return { ...s, deck: s.deck.slice(), openPile: s.openPile.slice(),
+    hands: s.hands.map(h => h.slice()), known: s.known.map(k => k.slice()),
+    bound: s.bound.slice(), scores: s.scores.slice(),
+    slots: s.slots.map(a => a.map(x => new Set(x))) };
+}
+
+// One possible world: the opponent's unseen cards (respecting exclusions) + the draw pile.
+function sampleWorld(me) {
+  const pool = shuffled(hiddenPool(me));
+  const m = unknownCount(me);
+  const order = G.slots[me].length === m
+    ? G.slots[me].slice().sort((a, b) => b.size - a.size)
+    : Array.from({ length: m }, () => new Set());
+  const unknown = [];
+  for (const ex of order) {
+    if (!pool.length) break;
+    let k = pool.findIndex(c => !ex.has(rankOf(c)));
+    if (k < 0) k = 0;
+    unknown.push(pool.splice(k, 1)[0]);
+  }
+  const oppTotal = handTotal(G.known[me]) + unknown.reduce((s, c) => s + valueOf(c, G.jokerRank), 0);
+  return { unknown, deck: pool, oppTotal };
+}
+
+// Points difference (mine - theirs) if I show now against a hand totalling ot.
+function showDiff(t, ot) { return (t === 0 && ot === 0) ? 0 : (t < ot ? -ot : PENALTY); }
+
+function rolloutTurn(me) {
+  const opp = 1 - me;
+  G.turnsInRound++;
+  if (G.hands[me].length === 0) return endRound(me);
+  if (G.forceShow || G.turnsInRound > STALL_TURNS) {
+    if (G.forceShow || handTotal(G.hands[me]) <= handTotal(G.hands[opp])) return endRound(me);
+    G.forceShow = true; G.turn = opp; return null;
+  }
+  if (challengerShowCheck(me).shows) return endRound(me);
+  const d = challengerChooseDrop(me);
+  const a = dropGroup(me, d.cards);
+  if (!a.noPick) challengerPick(me, a);
+  G.turn = opp;
+  return null;
+}
+
+// Play one candidate move in one sampled world to the end of the round.
+// Returns (my points - opponent points) for the round; lower is better.
+function rollout(me, plan, w) {
+  const real = G, opp = 1 - me;
+  G = cloneState(real);
+  try {
+    G.hands[opp] = G.known[me].concat(w.unknown);
+    G.deck = w.deck.slice();
+    const a = dropGroup(me, plan.drop.cards);
+    if (!a.noPick) applyPick(me, a, plan.take);
+    G.turn = opp;
+    let r = null, shower = -1, guard = 0;
+    while (!G.roundOver && guard++ < 60) {
+      const who = G.turn, x = rolloutTurn(who);
+      if (x) { r = x; shower = who; }
+    }
+    if (r) return shower === me ? r.showerPts - r.otherPts : r.otherPts - r.showerPts;
+    return handTotal(G.hands[me]) - handTotal(G.hands[opp]);
+  } finally { G = real; }
+}
+
+async function mcDecide(me) {
+  const t = handTotal(G.hands[me]);
+  const top = G.topOpen;
+  const plans = [];
+  for (const d of challengerRankDrops(me).slice(0, 5)) {
+    plans.push({ drop: d, take: false });
+    if (top && d.rank !== rankOf(top)) plans.push({ drop: d, take: true });
+  }
+  const sums = plans.map(() => 0);
+  let showSum = 0, n = 0;
+  const t0 = performance.now();
+  while (n < MC.max && (n < MC.min || performance.now() - t0 < MC.ms)) {
+    const w = sampleWorld(me);
+    if (t <= SHOW_MAX) showSum += showDiff(t, w.oppTotal);
+    plans.forEach((p, i) => { sums[i] += rollout(me, p, w); });
+    n++;
+    if (n % 6 === 0) await new Promise(r => setTimeout(r, 0));  // keep the UI alive
+  }
+  let bi = 0;
+  sums.forEach((s, i) => { if (s < sums[bi]) bi = i; });
+  const bestEV = sums[bi] / n, showEV = t <= SHOW_MAX ? showSum / n : Infinity;
+  return { show: showEV <= bestEV, t, drop: plans[bi].drop, take: plans[bi].take, n, showEV, bestEV };
+}
+
+async function mcTurnCore(me) {          // headless version for simulation
+  const opp = 1 - me;
+  G.turnsInRound++;
+  if (G.hands[me].length === 0) return endRound(me);
+  if (G.forceShow || G.turnsInRound > STALL_TURNS) {
+    if (G.forceShow || handTotal(G.hands[me]) <= handTotal(G.hands[opp])) return endRound(me);
+    G.forceShow = true; G.turn = opp; return null;
+  }
+  const plan = await mcDecide(me);
+  if (plan.show) return endRound(me);
+  const a = dropGroup(me, plan.drop.cards);
+  if (!a.noPick) applyPick(me, a, plan.take);
+  G.turn = opp;
+  return null;
+}
+
+// MC bot (player 1) vs challenger heuristic (player 0). Use from the console: await runSimMC(100)
+async function runSimMC(games) {
+  const saved = { ...MC }; MC.ms = 30; MC.min = 12;
+  const wins = [0, 0]; let ties = 0;
+  for (let g = 0; g < games; g++) {
+    G = newState();
+    while (!G.gameOver) {
+      dealCore();
+      while (!G.roundOver) { if (G.turn === 0) rolloutTurn(0); else await mcTurnCore(1); }
+    }
+    if (G.scores[0] < G.scores[1]) wins[0]++; else if (G.scores[1] < G.scores[0]) wins[1]++; else ties++;
+  }
+  Object.assign(MC, saved);
+  return { games, challenger: wins[0], mc: wins[1], ties };
 }
 // ============================================================================
 
@@ -393,8 +551,7 @@ function botPick(me, a) {
     G.known[opp].push(c);            // the opponent sees we took this card
     return { type: "take", card: c };
   }
-  const c = drawFromDeck();
-  if (c) G.hands[me].push(c);
+  const c = drawInto(me);
   return { type: "draw", card: c };
 }
 function botShowCheck(me) {
@@ -964,7 +1121,7 @@ function pickIndices(me, cards) {
 async function botTurnUI() {
   busy = true; phase = "botwait"; setButtons();
   setStatus("Bot is thinking", "think");
-  await sleep(700);
+  await sleep(300);
   G.turnsInRound++;
   if (G.hands[1].length === 0) { log("The bot has no cards left, so it shows."); finishRoundUI(1); return; }
   if (G.forceShow || G.turnsInRound > STALL_TURNS) {
@@ -977,21 +1134,21 @@ async function botTurnUI() {
     return;
   }
 
-  // 1. Show check, before the drop.
-  const sc = challengerShowCheck(1);
-  if (sc.shows) {
-    log(`Bot shows with ${sc.t} (chance ${Math.round(sc.est.P * 100)}%).`);
+  // 1. Monte Carlo decision: show now, or which drop and pick.
+  const plan = await mcDecide(1);
+  if (plan.show) {
+    log(`Bot shows with ${plan.t}.`);
     finishRoundUI(1);
     return;
   }
 
   // 2. Drop: the cards fly from the bot's row to the open pile.
-  const drop = challengerChooseDrop(1);
+  const drop = plan.drop;
   const fromBoxes = pickIndices(1, drop.cards).map(i => cardBox($("botHand").children[i]));
   const a = dropGroup(1, drop.cards);
   lastDropCount = drop.cards.length;
   pendingTake = a;
-  log(`Challenger drops ${drop.cards.length} card(s): ${drop.cards.join(" ")}.`);
+  log(`Bot drops ${drop.cards.length} card(s): ${drop.cards.join(" ")}.`);
   SFX.drop();
   renderAll();
   await dropFlight(drop.cards, fromBoxes);
@@ -1002,7 +1159,7 @@ async function botTurnUI() {
     const underEl = $("open").querySelector(".card.under");
     const underBox = underEl ? cardBox(underEl) : cardBox($("open"));
     const deckBox = cardBox($("deck"));
-    const p = challengerPick(1, a);
+    const p = applyPick(1, a, plan.take);
     pendingTake = null;
     renderAll();
     const el = lastCardEl("botHand");
@@ -1144,8 +1301,7 @@ async function onDraw() {
   const from = cardBox($("deck"));
   if (G.deck.length === 0 && G.openPile.length > 1) { log("The draw pile is empty: reshuffling."); SFX.shuffle(); }
   pendingTake = null;
-  const c = drawFromDeck();
-  if (c) G.hands[0].push(c);
+  const c = drawInto(0);
   SFX.deal();
   log("You draw from the pile.");
   renderAll();
@@ -1319,6 +1475,14 @@ if (params.has("sim")) {
   console.log("Simulation", r);
   $("start").classList.add("hidden");
   log(`Simulation: ${r.games} games, P0 ${r.wins[0]}, P1 ${r.wins[1]}, ties ${r.ties}, avg rounds ${r.avgRounds.toFixed(2)}`);
+}
+if (params.has("mcsim")) {
+  $("start").classList.add("hidden");
+  log("Running Monte Carlo simulation…");
+  runSimMC(parseInt(params.get("mcsim"), 10) || 50).then(r => {
+    console.log("MC simulation", r);
+    log(`MC simulation: ${r.games} games, challenger ${r.challenger}, MC bot ${r.mc}, ties ${r.ties}`);
+  });
 }
 if (params.has("test")) {
   const r = selfTest();
