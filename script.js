@@ -187,7 +187,8 @@ function estimateOpponent(me, myT) {
 }
 function expectedGain(e) { return e.winPts - PENALTY * e.penProb; }
 
-// Bot pick rule: match first, else take if value < hidden average - pickF.
+// Match-first pickup preserves a useful same-rank group for a later drop.
+// If there is no match, take a low-value open card only when it beats the draw estimate.
 function botTakesOpen(me, openCard) {
   if (!openCard) return false;
   const r = rankOf(openCard);
@@ -229,20 +230,154 @@ function getDropOptions(me) {
     return d;
   });
 }
-// Plan B (rounds 1..bait): 6s, then 8s, then 7s. Plan A otherwise: highest score.
+// Conservative greedy tie-break: keep the risk-adjusted score as the main signal,
+// but do not let a tiny score difference force an obviously weaker point-removal move.
+const GREEDY_SCORE_MARGIN = 2.0;
+const GREEDY_EXTRA_CARD_BONUS = 0.5;
+
+function groupPointValue(cards) {
+  return cards.reduce((sum, c) => sum + valueOf(c, G.jokerRank), 0);
+}
+function greedyDropValue(drop) {
+  return groupPointValue(drop.cards)
+       + GREEDY_EXTRA_CARD_BONUS * Math.max(0, drop.cards.length - 1);
+}
+
+// Plan B (rounds 1..bait): 6s, then 8s, then 7s. Otherwise use the
+// risk-adjusted score, then a greedy tie-break when scores are within 2 points.
 function chooseDrop(me) {
   let opts = getDropOptions(me);
-  // Never throw away a zero-value card (joker or joker rank) while other cards can be dropped.
+
+  // Keep zero-point jokers/joker-rank cards while any positive-point group exists.
   const nonZero = opts.filter(o => o.cards.some(c => valueOf(c, G.jokerRank) > 0));
   if (nonZero.length) opts = nonZero;
+
   if (G.round <= PAR[me].bait) {
     for (const r of ["6", "8", "7"]) {
       const o = opts.find(x => x.rank === r);
       if (o) return o;
     }
   }
-  return opts.reduce((a, b) => (b.score > a.score ? b : a));
+
+  const best = opts.reduce((a, b) => (b.score > a.score ? b : a));
+  const nearBest = opts.filter(o => best.score - o.score <= GREEDY_SCORE_MARGIN + 1e-9);
+  let chosen = nearBest[0] || best;
+
+  for (const option of nearBest.slice(1)) {
+    const optionValue = greedyDropValue(option);
+    const chosenValue = greedyDropValue(chosen);
+    if (optionValue > chosenValue + 1e-9 ||
+        (Math.abs(optionValue - chosenValue) <= 1e-9 && option.score > chosen.score)) {
+      chosen = option;
+    }
+  }
+
+  chosen.greedyTieBreak = chosen !== best && chosen.score < best.score - 1e-9;
+  chosen.greedyScoreGap = Math.max(0, best.score - chosen.score);
+  return chosen;
 }
+
+// ==== Challenger strategy (tuned against the original bot) ===================
+// This is a heuristic policy, not a mathematically proven optimal solver.
+const CHALLENGER_CFG = Object.freeze({
+  riskModel: "corrected",
+  oppRisk: 2,
+  pickMargin: 1.5,
+  showMargin: 30,
+  safeShowPenProb: 0.005,
+  groupBonus: 0.5,
+  noPickBonus: 2,
+  zeroGroupBonus: 1,
+  excludeZero: true,
+  setupThresholdBonus: 0.5,
+  setupW: 0.25
+});
+
+function exactHoldProbability(me, rank, pool) {
+  if (G.known[me].some(c => rankOf(c) === rank)) return 1;
+  const m = unknownCount(me), n = pool.length;
+  if (m <= 0 || n <= 0) return 0;
+  const copies = pool.filter(c => rankOf(c) === rank).length;
+  if (copies <= 0) return 0;
+  if (n - copies < m) return 1;
+  const denom = binom(n, m);
+  if (!(denom > 0)) return 0;
+  return Math.max(0, Math.min(1, 1 - binom(n - copies, m) / denom));
+}
+
+function challengerChooseDrop(me) {
+  let opts = getDropOptions(me);
+  const pool = hiddenPool(me);
+  const avg = poolAverage(pool);
+  const top = G.topOpen;
+  const topVal = top ? valueOf(top, G.jokerRank) : avg;
+  const hasTopRank = !!top && G.hands[me].some(c => rankOf(c) === rankOf(top));
+  const takesTop = !!top && (hasTopRank || topVal < avg - CHALLENGER_CFG.pickMargin);
+
+  if (CHALLENGER_CFG.excludeZero) {
+    const nonZero = opts.filter(o => o.cards.some(c => valueOf(c, G.jokerRank) > 0));
+    if (nonZero.length) opts = nonZero;
+  }
+
+  for (const o of opts) {
+    const points = o.cards.reduce((sum, c) => sum + valueOf(c, G.jokerRank), 0);
+    const noPick = !!top && o.rank === rankOf(top);
+    const exposedValue = valueOf(o.cards[o.cards.length - 1], G.jokerRank);
+    const rankProb = exactHoldProbability(me, o.rank, pool);
+    const ownPickupCost = noPick ? 0 : (takesTop ? topVal : avg);
+    const sizeBonus = CHALLENGER_CFG.groupBonus * Math.max(0, o.cards.length - 1);
+    const noPickBonus = noPick ? CHALLENGER_CFG.noPickBonus : 0;
+    const zeroGroupBonus = points === 0 ? CHALLENGER_CFG.zeroGroupBonus * o.cards.length : 0;
+    const setup = (!noPick && top)
+      ? G.hands[me].filter(c => rankOf(c) === rankOf(top))
+          .reduce((sum, c) => sum + valueOf(c, G.jokerRank), 0)
+      : 0;
+    const exposureCost = CHALLENGER_CFG.oppRisk * rankProb * exposedValue;
+    o.challengerScore = points - ownPickupCost - exposureCost
+      + sizeBonus + noPickBonus + zeroGroupBonus + CHALLENGER_CFG.setupW * setup;
+  }
+
+  opts.sort((a, b) => b.challengerScore - a.challengerScore
+    || b.cards.reduce((s,c)=>s+valueOf(c,G.jokerRank),0) - a.cards.reduce((s,c)=>s+valueOf(c,G.jokerRank),0)
+    || b.cards.length - a.cards.length);
+  return opts[0];
+}
+
+function challengerTakesOpen(me, openCard) {
+  if (!openCard) return false;
+  const r = rankOf(openCard);
+  if (G.hands[me].some(c => rankOf(c) === r)) return true;
+  const pool = hiddenPool(me);
+  const avg = poolAverage(pool);
+  const v = valueOf(openCard, G.jokerRank);
+  const matchPotential = pool.filter(c => rankOf(c) === r).length;
+  const threshold = avg - CHALLENGER_CFG.pickMargin
+    - CHALLENGER_CFG.setupThresholdBonus * (matchPotential > 0 ? 1 : 0);
+  return v < threshold;
+}
+
+function challengerPick(me, action) {
+  const opp = 1 - me;
+  if (challengerTakesOpen(me, action.prevOpen) && action.canTake) {
+    const c = takePrevOpen(action);
+    G.hands[me].push(c);
+    G.known[opp].push(c);
+    return { type: "take", card: c };
+  }
+  const c = drawFromDeck();
+  if (c) G.hands[me].push(c);
+  return { type: "draw", card: c };
+}
+
+function challengerShowCheck(me) {
+  const t = handTotal(G.hands[me]);
+  if (t > SHOW_MAX) return { shows: false, t };
+  const est = estimateOpponent(me, t);
+  const eg = expectedGain(est);
+  const safeShow = t === 0 || est.penProb <= CHALLENGER_CFG.safeShowPenProb;
+  return { shows: safeShow || eg >= CHALLENGER_CFG.showMargin, t, est, eg };
+}
+// ============================================================================
 
 // Bot turn pieces (also used by the UI so each step can be shown).
 function botDrop(me) {
@@ -843,7 +978,7 @@ async function botTurnUI() {
   }
 
   // 1. Show check, before the drop.
-  const sc = botShowCheck(1);
+  const sc = challengerShowCheck(1);
   if (sc.shows) {
     log(`Bot shows with ${sc.t} (chance ${Math.round(sc.est.P * 100)}%).`);
     finishRoundUI(1);
@@ -851,12 +986,12 @@ async function botTurnUI() {
   }
 
   // 2. Drop: the cards fly from the bot's row to the open pile.
-  const drop = chooseDrop(1);
+  const drop = challengerChooseDrop(1);
   const fromBoxes = pickIndices(1, drop.cards).map(i => cardBox($("botHand").children[i]));
   const a = dropGroup(1, drop.cards);
   lastDropCount = drop.cards.length;
   pendingTake = a;
-  log(`Bot drops ${drop.cards.length} card(s): ${drop.cards.join(" ")}.`);
+  log(`Challenger drops ${drop.cards.length} card(s): ${drop.cards.join(" ")}.`);
   SFX.drop();
   renderAll();
   await dropFlight(drop.cards, fromBoxes);
@@ -867,7 +1002,7 @@ async function botTurnUI() {
     const underEl = $("open").querySelector(".card.under");
     const underBox = underEl ? cardBox(underEl) : cardBox($("open"));
     const deckBox = cardBox($("deck"));
-    const p = botPick(1, a);
+    const p = challengerPick(1, a);
     pendingTake = null;
     renderAll();
     const el = lastCardEl("botHand");
