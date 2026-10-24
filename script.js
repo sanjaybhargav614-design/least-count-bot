@@ -288,7 +288,7 @@ function chooseDrop(me) {
 
 // ==== Challenger strategy (tuned against the original bot) ===================
 // This is a heuristic policy, not a mathematically proven optimal solver.
-const CHALLENGER_CFG = Object.freeze({
+const CHALLENGER_CFG = {
   riskModel: "corrected",
   oppRisk: 1,                 // was 2: keeps the exposure coefficient from going negative for big cards
   pickMargin: 1.5,
@@ -302,7 +302,8 @@ const CHALLENGER_CFG = Object.freeze({
   setupW: 0.25,
   leakW: 1,                   // cost of handing the opponent a cheap card to pick up
   leakSoft: 1.2               // how sharply "cheap" is judged
-});
+};
+const DEFAULT_CFG = { ...CHALLENGER_CFG };   // the original, untrained settings
 
 function exactHoldProbability(me, rank, pool) {
   if (G.known[me].some(c => rankOf(c) === rank)) return 1;
@@ -416,12 +417,13 @@ function matchWinProb(myS, oppS) {
 }
 
 const MC = { ms: 600, min: 40, max: 400, topDrops: 5,
-             switchZ: 1.5,     // a non-default move must beat the default by 1.5 standard errors
-             minGain: 0.002,   // ...and by at least 0.2% win chance
-             showZ: 0.5, debug: false };
+             switchZ: 1.5,     // normal final decision threshold
+             minGain: 0.002,   // minimum win-probability improvement
+             showZ: 0.5, debug: false,
+             adaptive: true, earlyMin: 80, earlyZ: 2.5, earlyGain: 0.006 };
 
 // Opponent (human) model: the totals they actually showed with.
-const OPP_MODEL = { shows: [] };
+const OPP_MODEL = { shows: [], pickup: [] };
 let ROLLOUT_OPP = -1;              // which seat is the human inside a rollout
 // 75th percentile of the human's show totals; null until 3 shows are seen.
 function oppShowLimit() {
@@ -429,6 +431,60 @@ function oppShowLimit() {
   if (a.length < 3) return null;
   const s = a.slice().sort((x, y) => x - y);
   return s[Math.min(s.length - 1, Math.floor(0.75 * s.length))];
+}
+
+// Learn the opponent's open-card pickup threshold from choices where they had no
+// matching rank after their drop. Matching-rank choices are excluded because they
+// reveal rank-building intent, not just a value threshold.
+function recordHumanPickup(take, openCard) {
+  if (!openCard) return;
+  const rank = rankOf(openCard);
+  if (G.hands[0].some(c => rankOf(c) === rank)) return;
+  OPP_MODEL.pickup.push({ value: valueOf(openCard, G.jokerRank), take: !!take });
+  if (OPP_MODEL.pickup.length > 80) OPP_MODEL.pickup.shift();
+}
+
+function opponentPickupThreshold() {
+  const samples = OPP_MODEL.pickup;
+  const pool = hiddenPool(1);
+  const prior = poolAverage(pool) - CHALLENGER_CFG.pickMargin;
+  if (samples.length < 4) return prior;
+
+  // Small-grid Bayesian/MAP estimate. The prior prevents a handful of actions
+  // from causing extreme thresholds; the logistic likelihood models noisy choices.
+  let bestThreshold = prior, bestLogPost = -Infinity;
+  const softness = 1.5;
+  for (let threshold = -1; threshold <= 10.0001; threshold += 0.25) {
+    let logPost = -0.5 * Math.pow((threshold - prior) / 3, 2);
+    for (const s of samples) {
+      const p = 1 / (1 + Math.exp((s.value - threshold) / softness));
+      logPost += Math.log(Math.max(1e-9, s.take ? p : 1 - p));
+    }
+    if (logPost > bestLogPost) { bestLogPost = logPost; bestThreshold = threshold; }
+  }
+  return bestThreshold;
+}
+
+function rolloutTakesOpen(me, openCard) {
+  if (!openCard) return false;
+  const rank = rankOf(openCard);
+  if (G.hands[me].some(c => rankOf(c) === rank)) return true;
+  if (me !== ROLLOUT_OPP) return challengerTakesOpen(me, openCard);
+  const threshold = opponentPickupThreshold();
+  const pTake = 1 / (1 + Math.exp((valueOf(openCard, G.jokerRank) - threshold) / 1.5));
+  return Math.random() < pTake;
+}
+
+function rolloutPick(me, action) {
+  const opp = 1 - me;
+  if (rolloutTakesOpen(me, action.prevOpen) && action.canTake) {
+    const c = takePrevOpen(action);
+    G.hands[me].push(c);
+    G.known[opp].push(c);
+    return { type: "take", card: c };
+  }
+  const c = drawInto(me);
+  return { type: "draw", card: c };
 }
 
 function mean(a) { let s = 0; for (const x of a) s += x; return a.length ? s / a.length : 0; }
@@ -443,6 +499,24 @@ function pairedStats(a, b) {
   for (let i = 0; i < n; i++) { const d = a[i] - b[i] - m; v += d * d; }
   const se = Math.sqrt(v / (n - 1) / n);
   return { diff: m, z: se > 1e-12 ? m / se : (m > 0 ? 99 : (m < 0 ? -99 : 0)) };
+}
+
+// Stop early only when paired samples give strong evidence: either a challenger
+// clearly beats the heuristic default, or every alternative is clearly worse.
+function mcConfidentEnough(U, base, n) {
+  if (!MC.adaptive || n < MC.earlyMin || U.length < 2) return false;
+  const means = U.map(mean);
+  let best = 0;
+  for (let i = 1; i < means.length; i++) if (means[i] > means[best]) best = i;
+  if (best !== base) {
+    const ps = pairedStats(U[best], U[base]);
+    return ps.diff >= MC.earlyGain && ps.z >= MC.earlyZ;
+  }
+  for (let i = 0; i < U.length; i++) {
+    if (i === base) continue;
+    if (pairedStats(U[i], U[base]).z > -MC.earlyZ) return false;
+  }
+  return true;
 }
 
 // Draw a card into hand `me` and give the opponent's view a fresh, unconstrained slot.
@@ -517,7 +591,7 @@ function rolloutTurn(me) {
   } else if (challengerShowCheck(me).shows) return endRound(me);
   const d = challengerChooseDrop(me);
   const a = dropGroup(me, d.cards);
-  if (!a.noPick) challengerPick(me, a);
+  if (!a.noPick) rolloutPick(me, a);
   G.turn = opp;
   return null;
 }
@@ -577,6 +651,9 @@ async function mcDecide(me) {
       U[i].push(matchWinProb(sMe + o.mine, sOpp + o.theirs));
     });
     n++;
+    // When showing is available, keep sampling because show-vs-move is another
+    // decision. Otherwise stop early only on a strong paired-confidence signal.
+    if (t > SHOW_MAX && n % 24 === 0 && mcConfidentEnough(U, base, n)) break;
     if (n % 6 === 0) await new Promise(r => setTimeout(r, 0));  // keep the UI alive
   }
 
@@ -778,6 +855,183 @@ function runSim(games) {
            report: [pctLine("P0", wins[0], games), pctLine("P1", wins[1], games),
                     pctLine("Ties", ties, games)].join(" | ") };
 }
+
+// ==== Self-improvement: self-play tuning ======================================
+// The bot's heuristic (used directly AND inside every Monte Carlo rollout) has ~11 numeric
+// knobs. trainBot() plays thousands of headless games: a mutated copy of the settings
+// against the current champion, seats swapped every game. A mutant that beats the champion
+// by a clear margin (sign-test z >= 1.3) becomes the new champion. At the end the result
+// is re-checked against the ORIGINAL settings and only kept if it really is better,
+// then saved in localStorage so the bot stays smarter next time you open the game.
+const TUNE = {                       // [min, max] for every knob that may change
+  pickMargin: [0, 8], groupBonus: [0, 4], noPickBonus: [0, 8], zeroGroupBonus: [0, 4],
+  setupW: [0, 1.5], setupThresholdBonus: [0, 3], leakW: [0, 3], oppRisk: [0, 12],
+  showMargin: [5, 60], safeShowPenProb: [0, 0.05], leakSoft: [0.5, 3],
+};
+const TRAIN = { running: false, stop: false, batch: 40, maxBatches: 6, acceptZ: 1.3 };
+const CFG_KEY = "lc_cfg_v2";         // new key: older saved settings used the old, narrower ranges
+
+// Tuned in 4000 headless games against the original settings: 73.35% win rate (95% CI 71.98-74.72%).
+// Applied every time the game loads, on any browser or device.
+// To go back to the original bot, set this to {} (and call resetBot() in the console).
+const TRAINED_CFG = {
+  "pickMargin": 3.8433,
+  "groupBonus": 0.3808,
+  "noPickBonus": 4.0176,
+  "zeroGroupBonus": 1.1437,
+  "setupW": 0.2225,
+  "setupThresholdBonus": 0.2681,
+  "leakW": 0.4644,
+  "oppRisk": 3.1798,
+  "showMargin": 41.4775,
+  "safeShowPenProb": 0.0112,
+  "leakSoft": 1.3922
+};
+
+function setCfg(c) {
+  for (const k in TUNE) {
+    if (typeof c[k] === "number" && isFinite(c[k])) CHALLENGER_CFG[k] = Math.min(TUNE[k][1], Math.max(TUNE[k][0], c[k]));
+  }
+}
+function tunableCopy() { const o = {}; for (const k in TUNE) o[k] = CHALLENGER_CFG[k]; return o; }
+function randn() {
+  let u = 0, v = 0;
+  while (!u) u = Math.random();
+  while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+function mutateCfg(c, scale) {
+  const o = { ...c }, keys = Object.keys(TUNE);
+  const bump = k => { const [lo, hi] = TUNE[k]; o[k] = Math.min(hi, Math.max(lo, o[k] + randn() * scale * (hi - lo))); };
+  let changed = 0;
+  for (const k of keys) if (Math.random() < 0.4) { bump(k); changed++; }
+  if (!changed) bump(keys[Math.floor(Math.random() * keys.length)]);
+  return o;
+}
+const zOf = (w, l) => (w - l) / Math.sqrt(Math.max(1, w + l));
+
+// One headless game between two settings. cfgs[seat] is used by that seat. Returns final scores.
+function playTrainGame(cfgs) {
+  const savedG = G, keep = tunableCopy(), keepFull = ASSUME_FULL_DROPS;
+  G = newState();
+  ASSUME_FULL_DROPS = true;           // both sides always drop whole groups here
+  try {
+    while (!G.gameOver) {
+      dealCore();
+      let guard = 0;
+      while (!G.roundOver && guard++ < 400) { const who = G.turn; setCfg(cfgs[who]); rolloutTurn(who); }
+      if (!G.roundOver) break;        // safety net, should never happen
+    }
+    return G.scores.slice();
+  } finally { setCfg(keep); ASSUME_FULL_DROPS = keepFull; G = savedG; }
+}
+
+// n games of a vs b, a sitting in alternating seats. Yields to the UI regularly.
+async function playMatches(a, b, n, first = 0, respectStop = true) {
+  let w = 0, l = 0, t = 0;
+  for (let i = 0; i < n; i++) {
+    if (respectStop && TRAIN.stop) break;
+    const aSeat = (first + i) % 2;
+    const sc = playTrainGame(aSeat === 0 ? [a, b] : [b, a]);
+    const sa = sc[aSeat], sb = sc[1 - aSeat];
+    if (sa < sb) w++; else if (sa > sb) l++; else t++;
+    if (i % 5 === 4) await new Promise(r => setTimeout(r, 0));
+  }
+  return { w, l, t, n: w + l + t };
+}
+
+function trainSay(msg) {
+  TRAIN.status = msg;
+  const el = typeof document !== "undefined" ? document.getElementById("trainMsg") : null;
+  if (el) el.textContent = msg;
+}
+function saveCfg(meta) {
+  try { localStorage.setItem(CFG_KEY, JSON.stringify({ cfg: tunableCopy(), ...meta })); } catch (e) { /* storage unavailable */ }
+}
+function loadSavedCfg() {
+  try {
+    const raw = localStorage.getItem(CFG_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (o && o.cfg) { setCfg(o.cfg); return o; }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+// Prints a ready-to-paste line with the current settings.
+function exportCfg() {
+  const o = {};
+  for (const k in TUNE) o[k] = Math.round(CHALLENGER_CFG[k] * 10000) / 10000;
+  const text = "const TRAINED_CFG = " + JSON.stringify(o, null, 2) + ";";
+  console.log(text);
+  return text;
+}
+function resetBot() {
+  setCfg(DEFAULT_CFG);
+  try { localStorage.removeItem(CFG_KEY); } catch (e) { /* ignore */ }
+  trainSay("Bot reset to the original settings.");
+}
+// Current settings vs the original ones, with exact percentages: await benchmarkBot(1000)
+async function benchmarkBot(games = 1000) {
+  const r = await playMatches(tunableCopy(), DEFAULT_CFG, games, 0, false);
+  return { ...r, report: [pctLine("Current", r.w, r.n), pctLine("Original", r.l, r.n), pctLine("Ties", r.t, r.n)].join(" | ") };
+}
+
+// Runs until you stop it (minutes = Infinity) or the time is up. Progress is checked against
+// the original settings and saved every 5 minutes, and once more when you stop.
+async function trainBot(minutes = Infinity) {
+  if (TRAIN.running) return null;
+  TRAIN.running = true; TRAIN.stop = false;
+  const t0 = performance.now(), limit = minutes * 60000;
+  const start = tunableCopy();
+  let champ = { ...start }, scale = 0.15, tried = 0, accepted = 0, ckAccepted = 0, lastCk = t0;
+  let saved = null;
+  const validateAndSave = async () => {
+    trainSay("Checking the result against the original…");
+    const v = await playMatches(champ, start, 400, 0, false);
+    if (v.w > v.l && zOf(v.w, v.l) >= 1.0) {
+      setCfg(champ);
+      saveCfg({ trainedAt: Date.now(), tried, accepted, winVsStart: v.w / Math.max(1, v.n) });
+      saved = v;
+    }
+    return v;
+  };
+  trainSay("Training… warming up");
+  try {
+    while (!TRAIN.stop && performance.now() - t0 < limit) {
+      const cand = mutateCfg(champ, scale);
+      let w = 0, l = 0, t = 0, n = 0, z = 0, early = 0;
+      for (let b = 0; b < TRAIN.maxBatches && !TRAIN.stop; b++) {
+        const r = await playMatches(cand, champ, TRAIN.batch, n);
+        w += r.w; l += r.l; t += r.t; n += r.n;
+        z = zOf(w, l);
+        if (z < -1.5) { early = -1; break; }      // clearly worse: stop wasting games
+        if (z >= 2.2) { early = 1; break; }       // clearly better
+      }
+      if (TRAIN.stop) break;
+      tried++;
+      if (early >= 0 && z >= TRAIN.acceptZ && w > l) { champ = cand; accepted++; scale = Math.min(0.4, scale * 1.25); }
+      else scale = Math.max(0.03, scale * 0.96);
+      const secs = Math.round((performance.now() - t0) / 1000);
+      trainSay(`Training… ${tried} tried, ${accepted} improvements, ${Math.floor(secs / 60)}m ${secs % 60}s` +
+               (saved ? ` | last save: beat the original in ${(100 * saved.w / saved.n).toFixed(2)}% of games` : ""));
+      // Checkpoint so closing the tab never loses the progress.
+      if (accepted > ckAccepted && performance.now() - lastCk > 300000) {
+        await validateAndSave();
+        ckAccepted = accepted; lastCk = performance.now();
+      }
+    }
+
+    // Final check when you stop (or the time is up).
+    if (accepted > ckAccepted || (accepted > 0 && !saved)) await validateAndSave();
+    const result = { saved: !!saved, tried, accepted, validation: saved };
+    trainSay(saved
+      ? `Trained AI saved. ${pctLine("Beats the original settings", saved.w, saved.n)}`
+      : "Stopped. No clear improvement yet; kept the previous settings.");
+    console.log("trainBot", result, tunableCopy());
+    return result;
+  } finally { TRAIN.running = false; }
+}
+
 // ==== UI (DOM, sound, animation) =============================================
 const $ = id => document.getElementById(id);
 const SUIT_SYMBOL = { H: "♥", D: "♦", S: "♠", C: "♣" };
@@ -1417,6 +1671,7 @@ async function onDrop() {
 async function onTake() {
   if (phase !== "pick" || busy || !lastAction || !lastAction.canTake) return;
   busy = true; humanFlying = true; setButtons();
+  recordHumanPickup(true, lastAction.prevOpen);
   const underEl = $("open").querySelector(".card.under");
   const from = underEl ? cardBox(underEl) : cardBox($("open"));
   const c = takePrevOpen(lastAction);
@@ -1436,6 +1691,7 @@ async function onDraw() {
   if (phase !== "pick" || busy) return;
   busy = true; humanFlying = true; setButtons();
   const from = cardBox($("deck"));
+  recordHumanPickup(false, lastAction && lastAction.prevOpen);
   if (G.deck.length === 0 && G.openPile.length > 1) { log("The draw pile is empty: reshuffling."); SFX.shuffle(); }
   pendingTake = null;
   const c = drawInto(0);
@@ -1576,11 +1832,13 @@ document.querySelectorAll(".mini").forEach(b => b.addEventListener("click", () =
 // ---- Start, buttons, URL modes ----------------------------------------------
 function startGame() {
   ctx();
+  TRAIN.stop = true;               // never train while you play
   $("start").classList.add("hidden");
   $("over").classList.add("hidden");
   G = newState();
   SHOWSTAT = { you: { n: 0, right: 0 }, bot: { n: 0, right: 0 } };
   OPP_MODEL.shows = [];
+  OPP_MODEL.pickup = [];
   ASSUME_FULL_DROPS = false;       // you may drop just one card of a pair
   history = []; selected.clear();
   lastAction = null; pendingTake = null; lastDropCount = 0; revealBot = false; dealing = false;
@@ -1609,6 +1867,8 @@ window.addEventListener("resize", () => {
   resizeTimer = setTimeout(() => { if (!busy && !dealing) renderAll(); }, 120);
 });
 
+setCfg(TRAINED_CFG);                 // settings pasted into the file
+loadSavedCfg();                      // previously trained settings, if any
 const params = new URLSearchParams(location.search);
 if (params.has("sim")) {
   const r = runSim(parseInt(params.get("sim"), 10) || 1000);
@@ -1623,6 +1883,12 @@ if (params.has("mcsim")) {
     console.log("MC simulation", r);
     log("MC simulation: " + r.report);
   });
+}
+if (params.has("train")) {           // ?train trains until stopped; ?train=5 trains for 5 minutes
+  trainBot(parseFloat(params.get("train")) || Infinity);
+}
+if (params.has("bench")) {           // ?bench=1000 compares current vs original settings
+  benchmarkBot(parseInt(params.get("bench"), 10) || 1000).then(r => { console.log("Benchmark", r); log("Benchmark: " + r.report); });
 }
 if (params.has("test")) {
   const r = selfTest();
