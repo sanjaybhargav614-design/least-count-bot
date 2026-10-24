@@ -96,7 +96,11 @@ function dealCore() {
   G.turn = G.player0Opens ? 0 : 1;
 }
 
-// Drop = every card of one rank. The card face-up before the drop stays under it.
+// Whether a drop is assumed to always contain every card of that rank the dropper holds.
+// The bot always does this; the human may drop just one of a pair, so startGame() turns it off.
+let ASSUME_FULL_DROPS = true;
+
+// Drop = cards of one rank. The card face-up before the drop stays under it.
 function dropGroup(me, cards) {
   const prev = G.topOpen;
   const a = {
@@ -109,7 +113,7 @@ function dropGroup(me, cards) {
     if (!removeOne(G.known[1 - me], c)) unseen++;   // the opponent now sees these cards
     G.openPile.push(c);
   }
-  trackDrop(1 - me, rankOf(cards[0]), unseen);
+  trackDrop(1 - me, rankOf(cards[0]), unseen, me === 1 || ASSUME_FULL_DROPS);
   if (a.canTake) a.prevIndex = G.openPile.length - cards.length - 1;
   const y = valueOf(cards[0], G.jokerRank);
   G.bound[me] = a.noPick ? 2 * y : y;
@@ -295,7 +299,9 @@ const CHALLENGER_CFG = Object.freeze({
   zeroGroupBonus: 1,
   excludeZero: true,
   setupThresholdBonus: 0.5,
-  setupW: 0.25
+  setupW: 0.25,
+  leakW: 1,                   // cost of handing the opponent a cheap card to pick up
+  leakSoft: 1.2               // how sharply "cheap" is judged
 });
 
 function exactHoldProbability(me, rank, pool) {
@@ -340,7 +346,11 @@ function challengerRankDrops(me) {
       : 0;
     // The opponent only saves one pick if they hold this rank, never more than an average card.
     const exposureCost = CHALLENGER_CFG.oppRisk * rankProb * Math.min(avg, exposedValue);
-    o.challengerScore = points - ownPickupCost - exposureCost
+    // The card left on top is the opponent's free pickup: a cheap one (2, A, 0) is a gift,
+    // a high one costs nothing. This stops the bot from dumping 2s and Aces for no reason.
+    const oppTakeProb = 1 / (1 + Math.exp((exposedValue - (avg - CHALLENGER_CFG.pickMargin)) / CHALLENGER_CFG.leakSoft));
+    const leakCost = CHALLENGER_CFG.leakW * oppTakeProb * Math.max(0, avg - exposedValue);
+    o.challengerScore = points - ownPickupCost - exposureCost - leakCost
       + sizeBonus + noPickBonus + zeroGroupBonus + CHALLENGER_CFG.setupW * setup;
   }
 
@@ -385,10 +395,55 @@ function challengerShowCheck(me) {
   return { shows: safeShow || eg >= CHALLENGER_CFG.showMargin, t, est, eg };
 }
 
-// ==== Monte Carlo decision engine ============================================
+// ==== Score-aware Monte Carlo decision engine ================================
 // Samples possible opponent hands (respecting what we know they cannot hold),
-// plays each candidate move out to the end of the round, and picks the best average.
-const MC = { ms: 400, min: 24, max: 200 };
+// plays each candidate move out to the end of the round, and picks the move that
+// maximises the chance of WINNING THE MATCH (not just this round's points):
+//   ahead   -> plays safe (avoids the 40-point wrong-show risk)
+//   behind  -> plays daring (shows on thinner odds, accepts variance)
+//   near 200 -> judged by who busts first
+// The bot only leaves the heuristic's default move when another move wins by a clear
+// statistical margin, so sampling noise cannot talk it into dropping a 2 or an A.
+
+const MATCH = { sigma: 18, avgPtsPerRound: 12 };   // smaller sigma = reacts more to the score
+
+// Rough match win chance for the player with score myS against oppS (lower score wins).
+function matchWinProb(myS, oppS) {
+  if (myS >= LIMIT || oppS >= LIMIT) return myS < oppS ? 1 : (myS > oppS ? 0 : 0.5);
+  const roundsLeft = Math.max(1, (LIMIT - Math.max(myS, oppS)) / MATCH.avgPtsPerRound);
+  const z = (oppS - myS) / (MATCH.sigma * Math.sqrt(roundsLeft));
+  return 1 / (1 + Math.exp(-1.7 * z));
+}
+
+const MC = { ms: 600, min: 40, max: 400, topDrops: 5,
+             switchZ: 1.5,     // a non-default move must beat the default by 1.5 standard errors
+             minGain: 0.002,   // ...and by at least 0.2% win chance
+             showZ: 0.5, debug: false };
+
+// Opponent (human) model: the totals they actually showed with.
+const OPP_MODEL = { shows: [] };
+let ROLLOUT_OPP = -1;              // which seat is the human inside a rollout
+// 75th percentile of the human's show totals; null until 3 shows are seen.
+function oppShowLimit() {
+  const a = OPP_MODEL.shows;
+  if (a.length < 3) return null;
+  const s = a.slice().sort((x, y) => x - y);
+  return s[Math.min(s.length - 1, Math.floor(0.75 * s.length))];
+}
+
+function mean(a) { let s = 0; for (const x of a) s += x; return a.length ? s / a.length : 0; }
+// Paired comparison: same sampled world, two different moves.
+function pairedStats(a, b) {
+  const n = Math.min(a.length, b.length);
+  if (n < 2) return { diff: 0, z: 0 };
+  let m = 0;
+  for (let i = 0; i < n; i++) m += a[i] - b[i];
+  m /= n;
+  let v = 0;
+  for (let i = 0; i < n; i++) { const d = a[i] - b[i] - m; v += d * d; }
+  const se = Math.sqrt(v / (n - 1) / n);
+  return { diff: m, z: se > 1e-12 ? m / se : (m > 0 ? 99 : (m < 0 ? -99 : 0)) };
+}
 
 // Draw a card into hand `me` and give the opponent's view a fresh, unconstrained slot.
 function drawInto(me) {
@@ -396,16 +451,17 @@ function drawInto(me) {
   if (c) { G.hands[me].push(c); G.slots[1 - me].push(new Set()); }
   return c;
 }
-// Viewer v saw the opponent drop `n` unseen cards of `rank`: those slots are gone,
-// and no remaining unseen card can be that rank.
-function trackDrop(v, rank, n) {
+// Viewer v saw the opponent drop `n` unseen cards of `rank`: those slots are gone.
+// If excludeRank, no remaining unseen card can be that rank (valid only when the dropper
+// always drops every card of a rank).
+function trackDrop(v, rank, n, excludeRank = true) {
   const sl = G.slots[v];
   for (let k = 0; k < n && sl.length; k++) {
     let best = -1;
     sl.forEach((s, i) => { if (!s.has(rank) && (best < 0 || s.size < sl[best].size)) best = i; });
     sl.splice(best < 0 ? sl.length - 1 : best, 1);
   }
-  for (const s of sl) s.add(rank);
+  if (excludeRank) for (const s of sl) s.add(rank);
 }
 function applyPick(me, a, take) {
   if (take && a.canTake) {
@@ -440,8 +496,11 @@ function sampleWorld(me) {
   return { unknown, deck: pool, oppTotal };
 }
 
-// Points difference (mine - theirs) if I show now against a hand totalling ot.
-function showDiff(t, ot) { return (t === 0 && ot === 0) ? 0 : (t < ot ? -ot : PENALTY); }
+// Points (mine, theirs) if I show now against a hand totalling ot.
+function showOutcome(t, ot) {
+  if (t === 0 && ot === 0) return { mine: 0, theirs: 0 };
+  return t < ot ? { mine: 0, theirs: ot } : { mine: PENALTY, theirs: 0 };
+}
 
 function rolloutTurn(me) {
   const opp = 1 - me;
@@ -451,7 +510,11 @@ function rolloutTurn(me) {
     if (G.forceShow || handTotal(G.hands[me]) <= handTotal(G.hands[opp])) return endRound(me);
     G.forceShow = true; G.turn = opp; return null;
   }
-  if (challengerShowCheck(me).shows) return endRound(me);
+  // The human seat inside a rollout uses the learned show habit once there is enough data.
+  const lim = (me === ROLLOUT_OPP) ? oppShowLimit() : null;
+  if (lim !== null) {
+    if (handTotal(G.hands[me]) <= Math.min(SHOW_MAX, lim)) return endRound(me);
+  } else if (challengerShowCheck(me).shows) return endRound(me);
   const d = challengerChooseDrop(me);
   const a = dropGroup(me, d.cards);
   if (!a.noPick) challengerPick(me, a);
@@ -460,10 +523,11 @@ function rolloutTurn(me) {
 }
 
 // Play one candidate move in one sampled world to the end of the round.
-// Returns (my points - opponent points) for the round; lower is better.
+// Returns both players' round points.
 function rollout(me, plan, w) {
   const real = G, opp = 1 - me;
   G = cloneState(real);
+  ROLLOUT_OPP = opp;
   try {
     G.hands[opp] = G.known[me].concat(w.unknown);
     G.deck = w.deck.slice();
@@ -475,33 +539,74 @@ function rollout(me, plan, w) {
       const who = G.turn, x = rolloutTurn(who);
       if (x) { r = x; shower = who; }
     }
-    if (r) return shower === me ? r.showerPts - r.otherPts : r.otherPts - r.showerPts;
-    return handTotal(G.hands[me]) - handTotal(G.hands[opp]);
-  } finally { G = real; }
+    if (r) return shower === me ? { mine: r.showerPts, theirs: r.otherPts }
+                                : { mine: r.otherPts, theirs: r.showerPts };
+    return { mine: handTotal(G.hands[me]), theirs: handTotal(G.hands[opp]) };
+  } finally { G = real; ROLLOUT_OPP = -1; }
 }
 
 async function mcDecide(me) {
+  const opp = 1 - me;
   const t = handTotal(G.hands[me]);
   const top = G.topOpen;
+  const sMe = G.scores[me], sOpp = G.scores[opp];
+
+  const drops = challengerRankDrops(me).slice(0, MC.topDrops);
   const plans = [];
-  for (const d of challengerRankDrops(me).slice(0, 5)) {
+  for (const d of drops) {
     plans.push({ drop: d, take: false });
     if (top && d.rank !== rankOf(top)) plans.push({ drop: d, take: true });
   }
-  const sums = plans.map(() => 0);
-  let showSum = 0, n = 0;
+  // Default move = what the heuristic would do.
+  const wantTake = !!top && drops[0].rank !== rankOf(top) && challengerTakesOpen(me, top);
+  let base = plans.findIndex(p => p.drop === drops[0] && p.take === wantTake);
+  if (base < 0) base = 0;
+
+  const U = plans.map(() => []);     // match win chance per sampled world, per plan
+  const S = [];                      // same, for "show now"
+  let n = 0;
   const t0 = performance.now();
   while (n < MC.max && (n < MC.min || performance.now() - t0 < MC.ms)) {
     const w = sampleWorld(me);
-    if (t <= SHOW_MAX) showSum += showDiff(t, w.oppTotal);
-    plans.forEach((p, i) => { sums[i] += rollout(me, p, w); });
+    if (t <= SHOW_MAX) {
+      const o = showOutcome(t, w.oppTotal);
+      S.push(matchWinProb(sMe + o.mine, sOpp + o.theirs));
+    }
+    plans.forEach((p, i) => {
+      const o = rollout(me, p, w);
+      U[i].push(matchWinProb(sMe + o.mine, sOpp + o.theirs));
+    });
     n++;
     if (n % 6 === 0) await new Promise(r => setTimeout(r, 0));  // keep the UI alive
   }
+
+  const means = U.map(mean);
   let bi = 0;
-  sums.forEach((s, i) => { if (s < sums[bi]) bi = i; });
-  const bestEV = sums[bi] / n, showEV = t <= SHOW_MAX ? showSum / n : Infinity;
-  return { show: showEV <= bestEV, t, drop: plans[bi].drop, take: plans[bi].take, n, showEV, bestEV };
+  means.forEach((m, i) => { if (m > means[bi]) bi = i; });
+  let switched = false;
+  if (bi !== base) {
+    const ps = pairedStats(U[bi], U[base]);
+    if (ps.diff >= MC.minGain && ps.z >= MC.switchZ) switched = true; else bi = base;
+  }
+
+  let show = false, showEV = -Infinity;
+  if (t <= SHOW_MAX && S.length) {
+    showEV = mean(S);
+    const ps = pairedStats(S, U[bi]);
+    show = ps.diff > 0 && ps.z >= MC.showZ;
+  }
+
+  if (MC.debug) {
+    console.log(`[bot] n=${n} total=${t} score ${sMe}:${sOpp} show=${(100 * showEV).toFixed(2)}%`);
+    console.table(plans.map((p, i) => ({
+      drop: p.drop.rank, take: p.take, heur: p.drop.challengerScore.toFixed(2),
+      winPct: (100 * means[i]).toFixed(2),
+      zVsDefault: i === base ? "-" : pairedStats(U[i], U[base]).z.toFixed(2),
+      default: i === base, chosen: i === bi && !show,
+    })));
+  }
+  return { show, t, drop: plans[bi].drop, take: plans[bi].take, n, showEV,
+           bestEV: means[bi], switched, winChance: show ? showEV : means[bi] };
 }
 
 async function mcTurnCore(me) {          // headless version for simulation
@@ -520,20 +625,37 @@ async function mcTurnCore(me) {          // headless version for simulation
   return null;
 }
 
-// MC bot (player 1) vs challenger heuristic (player 0). Use from the console: await runSimMC(100)
+// ---- Exact percentages for simulations ---------------------------------------
+// A win rate over 100 games can only be whole numbers, so use 1000+ games.
+function wilson(x, n, z = 1.96) {            // returns [low, high] in percent
+  if (!n) return [0, 0];
+  const p = x / n, d = 1 + z * z / n;
+  const c = (p + z * z / (2 * n)) / d;
+  const h = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
+  return [100 * (c - h), 100 * (c + h)];
+}
+function pctLine(name, x, n) {
+  const [lo, hi] = wilson(x, n);
+  return `${name}: ${(100 * x / n).toFixed(2)}% (95% CI ${lo.toFixed(2)}-${hi.toFixed(2)}%)`;
+}
+
+// MC bot (player 1) vs challenger heuristic (player 0). Use from the console: await runSimMC(1000)
 async function runSimMC(games) {
-  const saved = { ...MC }; MC.ms = 30; MC.min = 12;
-  const wins = [0, 0]; let ties = 0;
+  const saved = { ...MC }; MC.ms = 60; MC.min = 24;
+  const wins = [0, 0]; let ties = 0, lead = 0;
   for (let g = 0; g < games; g++) {
     G = newState();
     while (!G.gameOver) {
       dealCore();
       while (!G.roundOver) { if (G.turn === 0) rolloutTurn(0); else await mcTurnCore(1); }
     }
+    lead += G.scores[0] - G.scores[1];          // > 0 means the MC bot finished with fewer points
     if (G.scores[0] < G.scores[1]) wins[0]++; else if (G.scores[1] < G.scores[0]) wins[1]++; else ties++;
   }
   Object.assign(MC, saved);
-  return { games, challenger: wins[0], mc: wins[1], ties };
+  return { games, challenger: wins[0], mc: wins[1], ties, avgPointLead: lead / games,
+           report: [pctLine("Challenger", wins[0], games), pctLine("MC bot", wins[1], games),
+                    pctLine("Ties", ties, games)].join(" | ") + ` | MC avg point lead ${(lead / games).toFixed(2)}` };
 }
 // ============================================================================
 
@@ -652,7 +774,9 @@ function runSim(games) {
     else if (G.scores[1] < G.scores[0]) wins[1]++;
     else ties++;
   }
-  return { games, wins, ties, avgRounds: rounds / games };
+  return { games, wins, ties, avgRounds: rounds / games,
+           report: [pctLine("P0", wins[0], games), pctLine("P1", wins[1], games),
+                    pctLine("Ties", ties, games)].join(" | ") };
 }
 // ==== UI (DOM, sound, animation) =============================================
 const $ = id => document.getElementById(id);
@@ -669,6 +793,7 @@ let lastDropCount = 0;     // cards in the most recent drop group
 let dealing = false;       // true while cards are being dealt or collected
 let revealBot = false;     // show the bot's hand face up (round over)
 let history = [];          // one row per round: { round, you, bot }
+let SHOWSTAT = { you: { n: 0, right: 0 }, bot: { n: 0, right: 0 } };  // right/total shows per side
 let muted = false;
 let humanFlying = false;   // a card is flying into your hand: hand order is locked
 let suppressClick = false;
@@ -814,6 +939,7 @@ function renderInfo() {
     `<span class="chip">Round ${Math.max(1, shownRound)}</span>` +
     `<span class="chip joker" title="Cards of this rank are worth 0 this round">Joker rank <b>${jr}</b></span>` +
     `<span class="chip">You <b>${G.scores[0]}</b> : Bot <b>${G.scores[1]}</b></span>` +
+    `<span class="chip dim" title="Rough estimate from the score only">Bot win chance ~${(100 * matchWinProb(G.scores[1], G.scores[0])).toFixed(2)}%</span>` +
     `<span class="chip dim">first to ${LIMIT} loses</span>`;
   $("deckCount").textContent = `Draw: ${G.deck.length}`;
   $("openCount").textContent = `Open: ${G.openPile.length}`;
@@ -1188,7 +1314,14 @@ async function finishRoundUI(showerIdx) {
   busy = true; pendingTake = null;
   selected.clear();
   const roundNo = G.round;
+  // Exact chance (from the shower's own information) that this show is right.
+  const showT = handTotal(G.hands[showerIdx]);
+  const conf = estimateOpponent(showerIdx, showT);
+  const confPct = 100 * conf.P;
+  if (showerIdx === 0) OPP_MODEL.shows.push(showT);    // teaches the bot your show habits
   const r = endRound(showerIdx);
+  const key = showerIdx === 0 ? "you" : "bot";
+  SHOWSTAT[key].n++; if (r.right) SHOWSTAT[key].right++;
   const you = showerIdx === 0 ? r.showerPts : r.otherPts;
   const bot = showerIdx === 1 ? r.showerPts : r.otherPts;
   history.push({ round: roundNo, you, bot });
@@ -1212,6 +1345,7 @@ async function finishRoundUI(showerIdx) {
                 : r.right ? "right show" : "wrong show (penalty)";
   const myT = handTotal(G.hands[0]), botT = handTotal(G.hands[1]);
   log(`${who} showed: ${verdict}. Your hand ${myT}, bot ${botT}.`, r.tieZero ? "" : (you < bot ? "good" : "bad"));
+  log(`Show confidence before the reveal: ${confPct.toFixed(2)}% (exact).`);
   log(`Round points: you +${you}, bot +${bot}.`);
   const kind = r.tieZero ? "" : (you < bot ? "good" : "bad");
   const title = r.tieZero ? "Tie: no points"
@@ -1229,8 +1363,11 @@ async function finishRoundUI(showerIdx) {
     const tie = G.scores[0] === G.scores[1];
     await sleep(1600);
     if (youWin) { SFX.win(); confetti(); }
+    const sp = k => SHOWSTAT[k].n ? (100 * SHOWSTAT[k].right / SHOWSTAT[k].n).toFixed(2) + "%" : "n/a";
     showOver(tie ? "Tie game" : youWin ? "You win!" : "The bot wins",
-             `Final scores: you ${G.scores[0]}, bot ${G.scores[1]}.`);
+             `Final scores: you ${G.scores[0]}, bot ${G.scores[1]}. ` +
+             `Right shows: you ${sp("you")} (${SHOWSTAT.you.right}/${SHOWSTAT.you.n}), ` +
+             `bot ${sp("bot")} (${SHOWSTAT.bot.right}/${SHOWSTAT.bot.n}).`);
   }
 }
 
@@ -1442,6 +1579,9 @@ function startGame() {
   $("start").classList.add("hidden");
   $("over").classList.add("hidden");
   G = newState();
+  SHOWSTAT = { you: { n: 0, right: 0 }, bot: { n: 0, right: 0 } };
+  OPP_MODEL.shows = [];
+  ASSUME_FULL_DROPS = false;       // you may drop just one card of a pair
   history = []; selected.clear();
   lastAction = null; pendingTake = null; lastDropCount = 0; revealBot = false; dealing = false;
   $("log").innerHTML = "";
@@ -1474,14 +1614,14 @@ if (params.has("sim")) {
   const r = runSim(parseInt(params.get("sim"), 10) || 1000);
   console.log("Simulation", r);
   $("start").classList.add("hidden");
-  log(`Simulation: ${r.games} games, P0 ${r.wins[0]}, P1 ${r.wins[1]}, ties ${r.ties}, avg rounds ${r.avgRounds.toFixed(2)}`);
+  log(`Simulation: ${r.games} games | ${r.report} | avg rounds ${r.avgRounds.toFixed(2)}`);
 }
 if (params.has("mcsim")) {
   $("start").classList.add("hidden");
   log("Running Monte Carlo simulation…");
   runSimMC(parseInt(params.get("mcsim"), 10) || 50).then(r => {
     console.log("MC simulation", r);
-    log(`MC simulation: ${r.games} games, challenger ${r.challenger}, MC bot ${r.mc}, ties ${r.ties}`);
+    log("MC simulation: " + r.report);
   });
 }
 if (params.has("test")) {
