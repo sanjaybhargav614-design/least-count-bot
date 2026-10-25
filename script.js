@@ -2,8 +2,8 @@
 // v3: upgraded Monte Carlo bot (unbiased human show model, fast pools, fixed rollouts,
 //     persistent opponent learning). See "UPGRADE" notes inside the MC section.
 
-// Settings (same values as the C++ program).
-const LIMIT = 200, PENALTY = 40, SHOW_MAX = 6, STALL_TURNS = 60;
+// Settings (same values as the C++ program, except SHOW_MAX which is now 10).
+const LIMIT = 200, PENALTY = 40, SHOW_MAX = 10, STALL_TURNS = 60;
 const PAR = [
   { bait: 0, pickF: 2.5, margin: 3.0, boundFrom: -1, setupW: 0, oppW: 6 }, // player 0 (you)
   { bait: 0, pickF: 2.5, margin: 3.0, boundFrom: -1, setupW: 0, oppW: 6 }, // player 1 (bot)
@@ -469,7 +469,7 @@ function oppShowLimit() {
 // (same total counts 100%, total +-1 counts 40%).
 function humanShowProb(t) {
   if (t > SHOW_MAX) return 0;
-  const prior = t <= 1 ? 0.95 : t <= 2 ? 0.85 : t <= 4 ? 0.55 : 0.25;
+  const prior = t <= 1 ? 0.95 : t <= 2 ? 0.85 : t <= 4 ? 0.55 : t <= 6 ? 0.25 : 0.08;
   let s = 0, n = 0;
   for (const c of OPP_MODEL.showChoices) {
     const d = Math.abs(c.t - t);
@@ -1021,6 +1021,8 @@ const TRAIN = { running: false, stop: false, batch: 40, maxBatches: 6, acceptZ: 
 const CFG_KEY = "lc_cfg_v2";         // new key: older saved settings used the old, narrower ranges
 
 // Tuned in 4000 headless games against the original settings: 73.35% win rate (95% CI 71.98-74.72%).
+// NOTE: these values were tuned with SHOW_MAX = 6. For the new limit of 10, retrain with ?train=10
+// and paste the output of exportCfg() here.
 // Applied every time the game loads, on any browser or device.
 // To go back to the original bot, set this to {} (and call resetBot() in the console).
 const TRAINED_CFG = {
@@ -1201,6 +1203,7 @@ let muted = false;
 let humanFlying = false;   // a card is flying into your hand: hand order is locked
 let suppressClick = false;
 let drag = null;
+let rulesInGame = false;   // true when the rules were opened from the header during a game
 const selected = new Set();
 
 // ---- Sound ------------------------------------------------------------------
@@ -1321,7 +1324,7 @@ function cardBox(el) {
 const hide = el => { if (el) el.style.visibility = "hidden"; };
 const lastCardEl = rowId => { const k = $(rowId).lastElementChild; return k ? k.firstElementChild : null; };
 
-// ---- Score table -------------------------------------------------------------
+// ---- Score table and bars ----------------------------------------------------
 function renderScore() {
   const body = $("scoreBody");
   body.innerHTML = "";
@@ -1332,6 +1335,14 @@ function renderScore() {
   }
   $("totYou").textContent = G.scores[0];
   $("totBot").textContent = G.scores[1];
+
+  const bars = [["barYou", "barYouN", 0], ["barBot", "barBotN", 1]];
+  for (const [barId, numId, p] of bars) {
+    const pct = Math.min(100, 100 * G.scores[p] / LIMIT);
+    $(barId).style.width = pct + "%";
+    $(barId).classList.toggle("danger", pct >= 75);
+    $(numId).textContent = G.scores[p];
+  }
 }
 
 // ---- Rendering --------------------------------------------------------------
@@ -1457,6 +1468,7 @@ function selectionRank() {
 }
 
 function setButtons() {
+  document.body.dataset.phase = phase;      // drives the "whose turn" highlight in the CSS
   const t = handTotal(G.hands[0]);
   const sr = selectionRank();
   const vis = (id, on) => { $(id).hidden = !on; };
@@ -1980,8 +1992,50 @@ function onCardPointerDown(e, i, el) {
 }
 document.querySelectorAll(".mini").forEach(b => b.addEventListener("click", () => sortHand(b.dataset.sort)));
 
+// ---- Rules walkthrough (shown before the game, reopenable from the header) ----
+document.querySelectorAll("[data-showmax]").forEach(e => e.textContent = SHOW_MAX);
+document.querySelectorAll("[data-penalty]").forEach(e => e.textContent = PENALTY);
+document.querySelectorAll("[data-limit]").forEach(e => e.textContent = LIMIT);
+
+const RULE_PAGES = [...document.querySelectorAll(".rule-page")];
+let rulePage = 0;
+
+function showRulePage(n) {
+  rulePage = Math.max(0, Math.min(RULE_PAGES.length - 1, n));
+  RULE_PAGES.forEach((p, i) => { p.hidden = i !== rulePage; });
+  document.querySelectorAll("#rulePager i").forEach((d, i) => d.classList.toggle("on", i === rulePage));
+  const last = rulePage === RULE_PAGES.length - 1;
+  $("rulePrev").disabled = rulePage === 0;
+  $("ruleNext").hidden = last;
+  $("startBtn").hidden = !(last && !rulesInGame);
+  $("ruleResume").hidden = !(last && rulesInGame);
+  $("ruleX").hidden = !rulesInGame;
+  $("ruleSkip").hidden = last || rulesInGame;
+}
+function openRules(inGame) {
+  rulesInGame = inGame;
+  showRulePage(inGame ? rulePage : 0);
+  $("start").classList.remove("hidden");
+}
+function closeRules() { $("start").classList.add("hidden"); }
+
+$("rulePrev").addEventListener("click", () => showRulePage(rulePage - 1));
+$("ruleNext").addEventListener("click", () => showRulePage(rulePage + 1));
+$("ruleSkip").addEventListener("click", () => showRulePage(RULE_PAGES.length - 1));
+$("ruleResume").addEventListener("click", closeRules);
+$("ruleX").addEventListener("click", closeRules);
+$("rulesBtn").addEventListener("click", () => openRules(true));
+document.addEventListener("keydown", e => {
+  if ($("start").classList.contains("hidden")) return;
+  if (e.key === "Escape" && rulesInGame) closeRules();
+  if (e.key === "ArrowRight") showRulePage(rulePage + 1);
+  if (e.key === "ArrowLeft") showRulePage(rulePage - 1);
+});
+showRulePage(0);
+
 // ---- Start, buttons, URL modes ----------------------------------------------
 function startGame() {
+  rulesInGame = false;
   ctx();
   TRAIN.stop = true;               // never train while you play
   $("start").classList.add("hidden");
