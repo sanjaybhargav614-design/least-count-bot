@@ -8,16 +8,17 @@
 </head>
 <body>
 <header>
-  <h1>Least Count</h1>
+  <h1>♠ Least Count</h1>
   <div class="hright">
     <div id="info"></div>
-    <button id="muteBtn" aria-label="Toggle sound" title="Toggle sound">🔊</button>
+    <button id="rulesBtn" class="icon-btn" aria-label="Show rules" title="Show rules">? Rules</button>
+    <button id="muteBtn" class="icon-btn" aria-label="Toggle sound" title="Toggle sound">🔊</button>
   </div>
 </header>
 
 <div id="layout">
 <div id="table">
-  <div class="zone">
+  <div class="zone" id="botZone">
     <div class="label" id="botLabel">Bot</div>
     <div class="row" id="botHand"></div>
   </div>
@@ -26,7 +27,7 @@
     <div class="pile" id="open"><div class="count" id="openCount"></div></div>
     <div class="pile" id="joker"><div class="count" id="jokerCount"></div></div>
   </div>
-  <div class="zone">
+  <div class="zone" id="myZone">
     <div class="row" id="myHand"></div>
     <div class="label" id="myLabel">Your hand · <b id="myTotal"></b></div>
     <div class="sortbar"><span>Arrange:</span>
@@ -49,6 +50,11 @@
 </div>
 <aside id="score">
   <h3>Scores</h3>
+  <div class="bars">
+    <div class="barrow"><span>You</span><div class="bar"><i id="barYou"></i></div><b id="barYouN">0</b></div>
+    <div class="barrow"><span>Bot</span><div class="bar"><i id="barBot" class="botfill"></i></div><b id="barBotN">0</b></div>
+    <div class="barnote">First to <span data-limit></span> loses</div>
+  </div>
   <table>
     <thead><tr><th>Round</th><th>You</th><th>Bot</th></tr></thead>
     <tbody id="scoreBody"></tbody>
@@ -59,11 +65,64 @@
 
 <div id="banner"></div>
 
+<!-- Rules: shown before the game starts, and from the header "Rules" button -->
 <div id="start" class="overlay">
-  <h2>Least Count</h2>
-  <p>You play against the bot. Drop cards of one rank, then pick a card. Show when your total is 6 or less.
-     The lowest total wins. First to 200 loses.</p>
-  <button id="startBtn" class="primary">Start game</button>
+  <div class="rules-card" role="dialog" aria-modal="true" aria-labelledby="rulesTitle">
+    <button id="ruleX" class="rule-x" aria-label="Close rules" hidden>✕</button>
+    <h2 id="rulesTitle">How to play</h2>
+
+    <section class="rule-page">
+      <h3>🎯 The goal</h3>
+      <p>Finish each round with a <b>lower hand total</b> than the bot. Points are bad: you collect the
+         opponent's total when you win a round, or a penalty when you get it wrong.</p>
+      <ul>
+        <li>Each player gets <b>7 cards</b>, and one card is turned face up to start the open pile.</li>
+        <li>The purple <b>Joker card</b> on the table sets the <b>joker rank</b>: every card of that rank is worth <b>0</b> this round.</li>
+        <li>The first player to reach <b><span data-limit></span> points loses</b> the game.</li>
+      </ul>
+    </section>
+
+    <section class="rule-page" hidden>
+      <h3>🃏 Card values</h3>
+      <div class="values">
+        <div><span class="mc red">A♥</span><em>1 point</em></div>
+        <div><span class="mc">2</span>–<span class="mc">9</span><em>face value</em></div>
+        <div><span class="mc red">10</span><span class="mc">J</span><span class="mc red">Q</span><span class="mc">K</span><em>10 points</em></div>
+        <div><span class="mc wild">🃏</span><em>Jokers: 0 points</em></div>
+        <div><span class="mc wild">Joker rank</span><em>0 points (changes each round)</em></div>
+      </div>
+      <p class="tip">Tip: your running total is shown under your hand, and it turns green when you are allowed to show.</p>
+    </section>
+
+    <section class="rule-page" hidden>
+      <h3>🔁 Your turn</h3>
+      <ol class="steps">
+        <li><b>Show (optional).</b> If your total is <b><span data-showmax></span> or less</b>, you may end the round right now. Otherwise continue.</li>
+        <li><b>Drop.</b> Select one or more cards of the <b>same rank</b> and drop them on the open pile.</li>
+        <li><b>Pick.</b> Take the card that was face up <b>under</b> your drop, or draw from the pile.</li>
+      </ol>
+      <p class="tip">If the rank you drop matches the open card, you skip the pick. The bot sees which open cards you take, so use that to your advantage and watch what it takes too.</p>
+    </section>
+
+    <section class="rule-page" hidden>
+      <h3>🏁 Showing and scoring</h3>
+      <div class="score-cases">
+        <div class="case good"><b>Right show</b><span>Your total is <u>lower</u> than the bot's.<br>You +0 · Bot + its total</span></div>
+        <div class="case bad"><b>Wrong show</b><span>Equal or higher.<br>You +<span data-penalty></span> penalty · Bot +0</span></div>
+        <div class="case"><b>Both hands 0</b><span>A tie. No points.</span></div>
+      </div>
+      <p class="tip">Showing early is a gamble: the bot's hand is hidden. If you are not sure you are lowest, keep playing.</p>
+    </section>
+
+    <div id="rulePager" class="pager"><i></i><i></i><i></i><i></i></div>
+    <div class="rule-nav">
+      <button id="rulePrev">Back</button>
+      <button id="ruleNext" class="primary">Next</button>
+      <button id="startBtn" class="primary">Start game</button>
+      <button id="ruleResume" class="primary" hidden>Back to game</button>
+    </div>
+    <button id="ruleSkip" class="linkbtn">Skip rules</button>
+  </div>
 </div>
 
 <div id="over" class="overlay hidden">
